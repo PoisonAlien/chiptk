@@ -1,0 +1,532 @@
+#!/usr/bin/env bash
+set -e
+
+#author  : anand mayakonda <anandmt3@gmail.com>
+
+function usage() {
+  echo "$(tput setaf 3)
+---------------------------------------------------------------------------------------------------------------------------------------------------
+usage   : chiptk <command> [options]
+
+chiptk - A set of optimized protocols for ChIP seq alignment and peak calling.
+
+command : align     aligns single end fastq files from ChIP-seq using bowtie and removes duplicates
+          macspeaks peak calling with MACS2 and bigWig creation
+          SE        Super-Enhancer identification from bw file (using BAM files with ROSE is extremely slow)
+
+version : 1.0.0
+---------------------------------------------------------------------------------------------------------------------------------------------------
+"
+  tput sgr0
+}
+
+if [ $# -lt 1 ];then
+ usage
+ exit
+fi
+
+#*************************************************************************************************************************************
+function align_usage() {
+  echo "$(tput setaf 3)
+---------------------------------------------------------------------------------------------------------------------------------------------------
+usage: chiptk align [options] <picard> <output_fn> <Reference> <foo.fq.gz>
+
+wrapper around bowtie and picard MarkDcuplicate. Bowtie alignment parameters are optimized for 50 bp single end reads.
+bowtie -> picard
+
+positional arguments:
+  picard       path to picard jar file
+  output_fn    Basename for output file. Ususally sample name.
+  bowtie_idx   Bowtie index file for reference genome. Required.
+  fq           Fastq file (gz compressed). Required.
+
+optional arguments:
+  -D           Output directory to store results. Optional. Default ./bams
+  -t           threads to use. Default 4.
+  -k           report up to <int> good alignments per read (default: 2)
+  -n           max mismatches in seed (can be 0-3, default: -n 2)
+  -m           suppress all alignments if > <int> exist (default: 2)
+
+Example: align picard.jar foo hg19 foo.fq.gz
+---------------------------------------------------------------------------------------------------------------------------------------------------
+"
+tput sgr0
+}
+
+
+#*************************************************************************************************************************************
+function macspeaks_usage() {
+  echo "$(tput setaf 3)
+---------------------------------------------------------------------------------------------------------------------------------------------------
+usage: chiptk macspeaks [options] <hg19.chrom.sizes> <input.bam> <chip.bam>
+
+macspeaks - wrapper around macs2 callpeak. Also converts bedGraphs to bigWig following input signal subtraction. Uses hard-coded value of 200bp as fragment size for read extension.
+
+positional arguments:
+  chromSizes   path to chromosome sizes. Can be obtained using UCSC fetchChromSizes.sh script.
+  chip.bam     ChIP bam - Required.
+  input.bam    Input bam - Required.
+
+optional arguments:
+  -D           Output directory to store results. Optional. Default ./macs_op
+  -o           Basename for output file. Ususally sample name. Default parses from chip.bam
+  -f           Format of Input file, "AUTO", "BED" or "ELAND" or "ELANDMULTI" or "ELANDEXPORT" or "SAM" or "BAM" or "BOWTIE" or "BAMPE" or "BEDPE"
+  -g           Effective genome size. Default hs. (can be mm, ce, dm)
+  -q           Minimum FDR (q-value) cutoff for peak detection. Deafult 0.01
+  -b           call broad peaks. Default false.
+
+Example: macspeaks hg19.chrom.sizes KOCebpeInput.bam KOCebpe.bam
+---------------------------------------------------------------------------------------------------------------------------------------------------
+"
+tput sgr0
+}
+
+#*************************************************************************************************************************************
+function SE_usage() {
+  echo "$(tput setaf 3)
+---------------------------------------------------------------------------------------------------------------------------------------------------
+Usage: chiptk SE [options] <rose> <peaks> <input> <chip>
+
+Identify SuperEnhancers using BigWig files instead of BAM files. (Usaually from H3K27Ac or H3K4Me1 pulldown)
+ROSE which uses BAM files for signal extraction is emabarrisingly slow. Using bw files with bwtools can achieve this within minutes.
+
+positional arguments:
+  rose  path to 'ROSE_callSuper.R' Rscript. This comes as a part of ROSE software
+  peaks Input enhancer peaks.
+  bwc   BigWig sample for Control. Input
+  bwt   BigWig sample for Treatment. ChIP
+
+optional arguments:
+  -m    Distance to merge closely spaced peaks in bps. Default 12000.
+  -D    Output directory to store results. Optional. Default ./SE
+  -o    Basename for output file. Ususally sample name. Default parses from bwt
+
+Example: SE ROSE_callSuper.R H3K27Ac_peaks.narrowPeak H3K27Ac_control.bw H3K27Ac_treat.bw
+---------------------------------------------------------------------------------------------------------------------------------------------------
+"
+tput sgr0
+}
+
+
+#*************************************************************************************************************************************
+function align_check() {
+  samt=`which samtools || true`
+  if [ ! -f "$samt" ];then
+   echo "$(tput setaf 1)samtools not found. Get it from here: http://www.htslib.org/download/"
+   tput sgr0
+   exit
+  fi
+
+  bowt=`which bowtie || true`
+  if [ ! -f "$bowt" ];then
+   echo "$(tput setaf 1)bowtie not found. Get it from here: http://bowtie-bio.sourceforge.net/index.shtml"
+   tput sgr0
+   exit
+  fi
+}
+
+#*************************************************************************************************************************************
+function macs_check() {
+  mact=`which macs2 || true`
+  if [ ! -f "$mact" ];then
+   echo "$(tput setaf 1)macs2 not found!"
+   tput sgr0
+   exit
+  fi
+}
+
+#*************************************************************************************************************************************
+function align(){
+
+  if test -z "$4"
+    then
+	  align_usage
+	  exit 1
+  fi
+
+  align_check
+
+  output_dir="./bams/"
+  threads=4
+  dt=`date --iso-8601`
+  rdgrp=""
+  kmax=2
+  mmax=2
+  nmax=2
+
+  while getopts ":hw:D:t:k:n:m:" OPTION
+  do
+    case "${OPTION}" in
+      h)
+        align_usage
+        exit 1
+        ;;
+      D)
+        output_dir="$OPTARG"
+        ;;
+      t)
+        threads="$OPTARG"
+        ;;
+      k)
+        kmax="$OPTARG"
+        ;;
+      n)
+        nmax="$OPTARG"
+        ;;
+      m)
+        mmax="$OPTARG"
+        ;;
+      ?)
+        unkOpt="$OPTARG"
+        align_usage
+        echo -e "Unknown option: ${unkOpt}"
+        exit
+        ;;
+    esac
+  done
+
+  align_check
+
+  picard="${@:${OPTIND}:1}"
+  output_fn="${@:$((${OPTIND}+1)):1}"
+  bowtie_idx="${@:$((${OPTIND}+2)):1}"
+  fq="${@:$((${OPTIND}+3)):1}"
+
+  #rdgrp="\"@RG\tID:${output_fn}\tSM:${output_fn}\tLB:${output_fn}\tPL:illumina\tPU:Unknown\tDT:${dt}\""
+
+  if [[ -z "$output_fn" ]]
+  then
+    align_usage
+    echo -e "Please provide a basename for output file. Usally sample name. \n"
+    exit 0
+  elif [[ -z "$fq" ]] || [[ ! -f "$fq" ]]
+  then
+    align_usage
+    echo -e "forward fastq $fq1 does not exists!"
+    exit 0
+  elif [[ -z "$bowtie_idx" ]]
+  then
+    align_usage
+    echo -e "Please provide a bowtie index file. \n"
+    exit 0
+  elif [[ -z "$picard" ]] || [[ ! -f "$picard" ]]
+  then
+    align_usage
+    echo -e "$picard index does not exists"
+    exit 0
+  fi
+
+  mkdir -p ${output_dir}
+  fqDs=`basename ${fq}`
+
+  echo -e "$(tput setaf 3)$(date): Aligning.. \n"
+  algnCmd="zcat $fq |
+           bowtie -e 70 -m ${mmax} -k ${kmax} -n ${nmax} --best --strata --un $output_dir"/"$output_fn.unaligned.fq --max $output_dir"/"$output_fn.maxaligned.fq \
+           --sam --chunkmbs 250 -t -p ${threads} --sam-RG SM:$output_fn --sam-RG LB:$output_fn \
+           --sam-RG ID:$output_fn --sam-RG PL:ILLUMINA --sam-RG CN:CSI_HPK_Lab --sam-RG DS:$fqDs --sam-RG DT:$dt ${bowtie_idx} - \
+           2>> $output_dir"/"$output_fn.aln.log | samtools view -@ ${threads} -bS - | samtools sort -o $output_dir"/"$output_fn.bam -@ ${threads} -"
+
+  echo -e "align command: " > $output_dir"/"$output_fn.aln.log
+  echo -e "-----------------" >> $output_dir"/"$output_fn.aln.log
+  echo -e $algnCmd >> $output_dir"/"$output_fn.aln.log
+  echo -e "-----------------\n" >> $output_dir"/"$output_fn.aln.log
+
+  eval $algnCmd
+
+  echo -e "\n$(tput setaf 3)$(date): Compressing unaligned and maxaligned reads.."
+  gzip -f $output_dir"/"$output_fn.unaligned.fq &
+  gzip -f $output_dir"/"$output_fn.maxaligned.fq
+
+  echo -e "\n$(date): Alignment stats.. \n"
+  cat $output_dir"/"$output_fn.aln.log
+
+  echo -e "\n$(date): Removing duplicates.. \n"
+  rmdupCmd="java -d64 -jar $picard MarkDuplicates I= $output_dir"/"$output_fn.bam O= $output_dir"/"$output_fn.markDup.bam \
+            M= $output_dir"/"$output_fn.markDup.metric ASSUME_SORTED= true REMOVE_DUPLICATES= true CREATE_INDEX= true \
+            2> $output_dir"/"$output_fn.picard.log"
+
+  eval ${rmdupCmd}
+
+  cat $output_dir"/"$output_fn.markDup.metric
+
+  echo -e "\n$(date): Cleaning.."
+  mv $output_dir"/"$output_fn.markDup.bam $output_dir"/"$output_fn.bam
+  mv $output_dir"/"$output_fn.markDup.bai $output_dir"/"$output_fn.bam.bai
+
+  echo -e "\n$(date): Finished!"
+
+  tput sgr0
+}
+
+#*************************************************************************************************************************************
+# from https://gist.github.com/taoliu/2469050
+function bdg2bw() {
+
+  F=$1
+  G=$2
+
+  bedtools slop -i ${F} -g ${G} -b 0 | bedClip stdin ${G} ${F}.clip
+
+  LC_COLLATE=C sort -k1,1 -k2,2n ${F}.clip > ${F}.sort.clip
+
+  bedGraphToBigWig ${F}.sort.clip ${G} ${F/bdg/bw}
+
+  rm -f ${F}.clip ${F}.sort.clip
+}
+
+#*************************************************************************************************************************************
+function macspeaks(){
+
+  if test -z "$3"
+    then
+	  macspeaks_usage
+	  exit 1
+  fi
+
+  macs_check
+
+  output_dir="./macs_op/"
+  gsize="hs"
+  qmin=0.01
+  broad="false"
+  format="AUTO"
+
+  while getopts ":hw:D:o:f:g:q:b:" OPTION
+  do
+    case "${OPTION}" in
+      h)
+        macspeaks_usage
+        exit 1
+        ;;
+      D)
+        output_dir="$OPTARG"
+        ;;
+      o)
+        output_fn="$OPTARG"
+        ;;
+      g)
+        gsize="$OPTARG"
+        ;;
+      q)
+        qmin="$OPTARG"
+        ;;
+      b)
+        broad="$OPTARG"
+        ;;
+      f)
+        format="$OPTARG"
+        ;;
+      ?)
+        unkOpt="$OPTARG"
+        macspeaks_usage
+        echo -e "Unknown option: ${unkOpt}"
+        exit
+        ;;
+    esac
+  done
+
+  chromSizes="${@:${OPTIND}:1}"
+  chip="${@:$((${OPTIND}+1)):1}"
+  input="${@:$((${OPTIND}+2)):1}"
+
+  if [[ -z "${output_fn}" ]]
+  then
+    output_fn=`basename ${chip} | sed 's/.bam$//g'`
+  fi
+
+  if [[ -z "$chromSizes" ]] || [[ ! -f "$chromSizes" ]]
+  then
+    macspeaks_usage
+    echo -e "${chromSizes} does not exists \n"
+    exit 0
+  elif [[ -z "$chip" ]] || [[ ! -f "$chip" ]]
+  then
+    macspeaks_usage
+    echo -e "$chip does not exists!"
+    exit 0
+  elif [[ -z "$input" ]] || [[ ! -f "$input" ]]
+  then
+    macspeaks_usage
+    echo -e "$input does not exists"
+    exit 0
+  fi
+
+  mkdir -p ${output_dir}
+
+  if [[ "$broad" == "true" ]]
+  then
+    macsCmd="macs2 callpeak -t ${chip} -c ${input} -f ${format} -g ${gsize} --keep-dup 1 --outdir ${output_dir} \
+            --name ${output_fn} --bdg --SPMR --nomodel --extsize 200 -q ${qmin} --broad 2>> $output_dir"/"$output_fn.macs2Log"
+  elif [[ "$broad" == "false" ]]
+  then
+    macsCmd="macs2 callpeak -t ${chip} -c ${input} -f ${format} -g ${gsize} --keep-dup 1 --outdir ${output_dir} \
+            --name ${output_fn} --bdg --SPMR --nomodel --extsize 200 -q ${qmin} 2>> $output_dir"/"$output_fn.macs2Log"
+  else
+    macspeaks_usage
+    echo "-b can only be true or false"
+    exit 0
+  fi
+
+  echo -e "$(tput setaf 3)$(date): Running macs2 callpeak .. \n"
+  echo -e ${macsCmd} >> $output_dir"/"$output_fn.macs2Log
+  eval ${macsCmd}
+
+  echo -e "$(date): Finished calling Peaks for ${output_fn} \n"
+
+  if [[ "$broad" == "true" ]]
+  then
+    echo "$(date): Number of Peaks: `wc -l $output_dir/${output_fn}"_peaks.broadPeak"`"
+  else
+    echo "$(date): Number of Peaks: `wc -l $output_dir/${output_fn}"_peaks.narrowPeak"`"
+  fi
+
+  echo "$(date): Subtracting input signal from tretment.."
+  macs2 bdgcmp -t $output_dir"/"$output_fn"_treat_pileup.bdg" -c $output_dir"/"$output_fn"_control_lambda.bdg" -o $output_dir"/"$output_fn"_subtract.bdg" -m subtract
+  echo "$(date): Fixing negative values (sets them to zero).."
+  awk '{OFS="\t" ; if($4 < 0) {print $1,$2,$3,0} else {print $0}}' $output_dir"/"$output_fn"_subtract.bdg" > $output_dir"/"$output_fn"_inputMinus.bdg"
+  rm -f $output_dir"/"$output_fn"_subtract.bdg"
+
+  #From https://gist.github.com/taoliu/2469050
+  which bedtools &>/dev/null || { echo "bedtools not found! Try: sudo apt-get install bedtools"; exit 1; }
+  which bedGraphToBigWig &>/dev/null || { echo "bedGraphToBigWig not found! Download: <http://hgdownload.cse.ucsc.edu/admin/exe/>"; exit 1; }
+  which bedClip &>/dev/null || { echo "bedClip not found! Download: <http://hgdownload.cse.ucsc.edu/admin/exe/>"; exit 1; }
+
+  echo "$(date): Converting bedGraphs to bigWig.."
+  bdg2bw $output_dir"/"$output_fn"_inputMinus.bdg" ${chromSizes}
+  bdg2bw $output_dir"/"$output_fn"_control_lambda.bdg" ${chromSizes}
+  bdg2bw $output_dir"/"$output_fn"_treat_pileup.bdg" ${chromSizes}
+
+  mv $output_dir"/"$output_fn"_inputMinus.bw" $output_dir"/"$output_fn".bw"
+  rm $output_dir"/"$output_fn"_inputMinus.bdg"
+
+  echo "$(date): Done!"
+}
+
+#*************************************************************************************************************************************
+function SE(){
+
+  if test -z "$4"
+    then
+	  SE_usage
+	  exit 1
+  fi
+
+  output_dir="./SE/"
+  mergeDist=12000
+
+  while getopts ":hw:D:m:o:" OPTION
+  do
+    case "${OPTION}" in
+      h)
+        SE_usage
+        exit 1
+        ;;
+      D)
+        output_dir="$OPTARG"
+        ;;
+      o)
+        output_fn="$OPTARG"
+        ;;
+      m)
+        mergeDist="$OPTARG"
+        ;;
+      ?)
+        unkOpt="$OPTARG"
+        SE_usage
+        echo -e "Unknown option: ${unkOpt}"
+        exit
+        ;;
+      esac
+  done
+
+
+  rose="${@:${OPTIND}:1}"
+  peaks="${@:$((${OPTIND}+1)):1}"
+  bwc=${@:${OPTIND}+2:1}
+  bwt=${@:${OPTIND}+3:1}
+
+  if [[ -z "${output_fn}" ]]
+  then
+    output_fn=`basename ${bwt} | sed 's/.bw$//g' | sed 's/.bigWig$//g'`
+  fi
+
+  if [[ -z `which bwtool` ]]; then
+    echo -e "bwtool not found! Get it from here: https://github.com/CRG-Barcelona/bwtool"
+    exit
+  fi
+
+  if [[ -z `which bedtools` ]]; then
+    echo -e "bedtools not found! Get it from here: https://github.com/arq5x/bedtools2/releases"
+    exit
+  fi
+
+  if [[ -z "${rose}" ]] || [[ ! -f "${rose}" ]]; then
+    usage
+    echo -e "${rose} does not exists!"
+    exit
+  fi
+
+  if [[ -z "${peaks}" ]] || [[ ! -f "${peaks}" ]]; then
+    usage
+    echo -e "${peaks} does not exists!"
+    exit
+  fi
+
+  if [[ -z "${bwc}" ]] || [[ ! -f "${bwc}" ]]; then
+    echo -e "${bwc} does not exists!"
+    exit
+  fi
+
+  if [[ -z "${bwt}" ]] || [[ ! -f "${bwt}" ]]; then
+    echo -e "${bwt} does not exists!"
+    exit
+  fi
+
+  mkdir -p ${output_dir}
+
+  nPeaks=`grep -v "^#" ${peaks} | wc -l`
+  echo -e "\nInput peaks: ${nPeaks}"
+
+  grep -v "^#" ${peaks} | awk '{OFS="\t"; print $0,"Peak_"NR}' | bedtools merge -d ${mergeDist} -c 4 -o count | awk '{OFS="\t"; print $4"_peaks_stitched",$1,$2,$3,$4,$3-$2}' > ${output_dir}/${output_fn}.peaks.sticthed.bed
+
+  cut -f 2-4  ${output_dir}/${output_fn}.peaks.sticthed.bed > ${output_dir}/${output_fn}.temp.bed
+
+  nPeaks=`cat ${output_dir}/${output_fn}".temp.bed" | wc -l `
+  echo -e "Peaks after merging (${mergeDist}): ${nPeaks}"
+
+  echo -e "\nSummarizing bw files over bed regions.."
+  bwtool summary -header -with-sum -fill=0 -keep-bed ${output_dir}/${output_fn}.temp.bed $bwc ${output_dir}/${output_fn}.control.scores
+  bwtool summary -header -with-sum -fill=0 -keep-bed ${output_dir}/${output_fn}.temp.bed $bwt ${output_dir}/${output_fn}.treat.scores
+
+  echo -e "\nmaking ROSE input.."
+  echo -e "REGION_ID\tCHROM\tSTART\tSTOP\tNUM_LOCI\tCONSTITUENT_SIZE\t${output_fn}\t${output_fn}.wce" > ${output_dir}/${output_fn}.rose.ip
+
+  paste ${output_dir}/${output_fn}.treat.scores ${output_dir}/${output_fn}.control.scores | cut -f 10,20 | sed 1d | paste ${output_dir}/${output_fn}.peaks.sticthed.bed - >> ${output_dir}/${output_fn}.rose.ip
+
+  echo -e "\ncalling super enhancers from ROSE R script.."
+  Rscript ${rose} ${output_dir}/ ${output_dir}/${output_fn}.rose.ip ${output_fn} ${output_fn}".wce"
+
+  nSE=`wc -l ${output_dir}/${output_fn}"_Gateway_SuperEnhancers.bed"`
+  echo -e "\nNumber of SEs identified: ${nSE}"
+
+  rm ${output_dir}/${output_fn}".temp.bed"
+
+  echo -e "\nDone!"
+}
+
+#*************************************************************************************************************************************
+case "$1" in
+    'align')
+	align "${@:2}"
+	;;
+    'macspeaks')
+	macspeaks "${@:2}"
+  ;;
+    'SE')
+	SE "${@:2}"
+	;;
+    *)
+	usage
+	echo -e "Error: command \"$1\" not recognized\n"
+	exit 1
+esac
